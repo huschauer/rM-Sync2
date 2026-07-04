@@ -8,10 +8,68 @@ import json
 import shutil
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+STATE_FILENAME = ".remarkable_sync_state.json"
+
+
+def load_json_file(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise SyncError(f"Ungültige JSON-Datei {path}: {exc}") from exc
+
+
+def load_config(config_path: Optional[Path]) -> Dict[str, Any]:
+    if config_path is None:
+        return {}
+    config_path = config_path.expanduser()
+    if not config_path.exists():
+        return {}
+    return load_json_file(config_path)
+
+
+def resolve_path(value: Any, default: Path) -> Path:
+    if value is None:
+        return default
+    return Path(str(value)).expanduser()
+
+
+def load_state(output_root: Path, state_filename: str = STATE_FILENAME) -> Dict[str, Any]:
+    state_file = output_root / state_filename
+    state = load_json_file(state_file)
+    if not isinstance(state, dict):
+        return {"documents": {}}
+    if "documents" not in state or not isinstance(state["documents"], dict):
+        state["documents"] = {}
+    return state
+
+
+def save_state(output_root: Path, state: Dict[str, Any], state_filename: str = STATE_FILENAME) -> None:
+    state_file = output_root / state_filename
+    output_root.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def clean_state(state: Dict[str, Any], plan: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    state_documents = state.get("documents", {})
+    keep_ids = set(plan.keys())
+    state["documents"] = {
+        item_id: data
+        for item_id, data in state_documents.items()
+        if item_id in keep_ids
+    }
+    return state
+
+
+def remove_old_per_document_state_files(output_root: Path, log_path: Path) -> None:
+    for path in sorted(output_root.rglob("*.sync.json")):
+        log_line(f"Entferne altes per-Datei-Statefile {path}", log_path)
+        path.unlink(missing_ok=True)
 
 
 class SyncError(Exception):
@@ -137,7 +195,7 @@ def ensure_directory_structure(plan: Dict[str, Dict[str, Any]], output_root: Pat
             target.parent.mkdir(parents=True, exist_ok=True)
 
 
-def prune_stale_files(output_root: Path, plan: Dict[str, Dict[str, Any]], log_path: Path) -> None:
+def prune_stale_files(output_root: Path, plan: Dict[str, Dict[str, Any]], log_path: Path, state_filename: str = STATE_FILENAME) -> None:
     desired_files = {
         (output_root / item["relative_path"]).with_suffix(".pdf")
         for item in plan.values()
@@ -146,6 +204,8 @@ def prune_stale_files(output_root: Path, plan: Dict[str, Dict[str, Any]], log_pa
 
     for path in sorted(output_root.rglob("*"), reverse=True):
         if not path.is_file():
+            continue
+        if path.name == state_filename:
             continue
         if path.name.endswith(".sync.json"):
             continue
@@ -158,27 +218,28 @@ def prune_stale_files(output_root: Path, plan: Dict[str, Dict[str, Any]], log_pa
             path.rmdir()
 
 
-def should_download_document(output_path: Path, metadata_path: Path, remote_mtime: str | None) -> bool:
+def should_download_document(output_path: Path, state: Dict[str, Any], item_id: str, remote_mtime: Optional[str]) -> bool:
     if not output_path.exists():
         return True
 
-    if not metadata_path.exists():
-        return True
+    state_documents = state.get("documents", {})
+    document_state = state_documents.get(item_id, {})
+    existing_remote_value = document_state.get("lastModified")
+
+    if remote_mtime is None:
+        return existing_remote_value is None
 
     try:
-        remote_value = int(str(remote_mtime or "0"))
+        remote_value = int(str(remote_mtime))
     except ValueError:
         return True
 
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        local_value = int(str(metadata.get("lastModified", "0") or "0"))
-    except (json.JSONDecodeError, ValueError):
-        local_value = 0
-
-    if remote_value <= 0:
+    if existing_remote_value is None or existing_remote_value == "":
         return True
-    if local_value <= 0:
+
+    try:
+        local_value = int(str(existing_remote_value))
+    except ValueError:
         return True
 
     return remote_value > local_value
@@ -217,17 +278,16 @@ def upload_files(upload_dir: Path, recent_uploads_dir: Path, remote_host: str, l
     return len(files)
 
 
-def download_documents(plan: Dict[str, Dict[str, Any]], output_root: Path, remote_host: str, log_path: Path) -> int:
+def download_documents(plan: Dict[str, Dict[str, Any]], output_root: Path, remote_host: str, log_path: Path, state: Dict[str, Any], state_filename: str = STATE_FILENAME) -> int:
     document_ids = [item_id for item_id, item in plan.items() if item["type"] == "DocumentType"]
     downloaded = 0
     for index, item_id in enumerate(document_ids, start=1):
         item = plan[item_id]
         output_path = (output_root / item["relative_path"]).with_suffix(".pdf")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        metadata_path = output_path.with_suffix(".sync.json")
 
         remote_mtime = item.get("lastModified")
-        if not should_download_document(output_path, metadata_path, remote_mtime):
+        if not should_download_document(output_path, state, item_id, remote_mtime):
             print_progress(index, len(document_ids), f"Übersprungen: {output_path.name}")
             continue
 
@@ -236,19 +296,22 @@ def download_documents(plan: Dict[str, Dict[str, Any]], output_root: Path, remot
             print_progress(index, len(document_ids), f"Lade herunter: {output_path.name}")
             log_line(f"Lade {item_id} -> {output_path}", log_path)
             run_command(["curl", "-s", "-o", str(output_path), "-J", url])
-            metadata_path.write_text(json.dumps({"lastModified": remote_mtime}, indent=2), encoding="utf-8")
+            state.setdefault("documents", {})[item_id] = {
+                "lastModified": str(remote_mtime) if remote_mtime is not None else "",
+                "relative_path": str(item["relative_path"]),
+            }
             downloaded += 1
         except SyncError as exc:
             log_line(f"Fehler beim Download von {item_id}: {exc}", log_path)
+
+    save_state(output_root, state, state_filename=state_filename)
     return downloaded
 
 
-def sync_remarkable(remote_dir: str, remote_host: str, ssh_port: int, remote_user: str, main_dir: Path, backup_dir: Path, output_dir: Path, log_path: Path, max_backups: int = 10) -> int:
+def sync_remarkable(remote_dir: str, remote_host: str, ssh_port: int, remote_user: str, main_dir: Path, backup_dir: Path, output_dir: Path, log_path: Path, upload_dir: Path, recent_uploads_dir: Path, max_backups: int = 10, state_filename: str = STATE_FILENAME) -> int:
     if not main_dir.exists():
         main_dir.mkdir(parents=True, exist_ok=True)
 
-    upload_dir = main_dir / "Upload"
-    recent_uploads_dir = main_dir / "Recent Uploads"
     if recent_uploads_dir.exists():
         shutil.rmtree(recent_uploads_dir, ignore_errors=True)
     recent_uploads_dir.mkdir(parents=True, exist_ok=True)
@@ -259,9 +322,12 @@ def sync_remarkable(remote_dir: str, remote_host: str, ssh_port: int, remote_use
 
     plan = build_output_plan(metadata_by_id, str(output_dir))
     ensure_directory_structure(plan, output_dir)
-    prune_stale_files(output_dir, plan, log_path)
+    remove_old_per_document_state_files(output_dir, log_path)
+    prune_stale_files(output_dir, plan, log_path, state_filename=state_filename)
 
-    downloaded = download_documents(plan, output_dir, remote_host, log_path)
+    state = load_state(output_dir, state_filename=state_filename)
+    state = clean_state(state, plan)
+    downloaded = download_documents(plan, output_dir, remote_host, log_path, state, state_filename=state_filename)
     uploaded = upload_files(upload_dir, recent_uploads_dir, remote_host, log_path)
     log_line(f"Synchronisation abgeschlossen. Heruntergeladen: {downloaded}, Hochgeladen: {uploaded}", log_path)
     return downloaded
@@ -269,21 +335,35 @@ def sync_remarkable(remote_dir: str, remote_host: str, ssh_port: int, remote_use
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Sichere und synchronisiere Dateien von einem reMarkable")
-    parser.add_argument("--remote-dir", default="/home/root/.local/share/remarkable/xochitl/")
-    parser.add_argument("--remote-host", default="10.11.99.1")
-    parser.add_argument("--remote-user", default="root")
-    parser.add_argument("--ssh-port", type=int, default=22)
-    parser.add_argument("--main-dir", default=str(Path.home() / "Nextcloud" / "Documents" / "reMarkable"))
+    parser.add_argument("--config", default="config.json")
+    parser.add_argument("--remote-dir", default=None)
+    parser.add_argument("--remote-host", default=None)
+    parser.add_argument("--remote-user", default=None)
+    parser.add_argument("--ssh-port", type=int, default=None)
+    parser.add_argument("--main-dir", default=None)
     parser.add_argument("--backup-dir", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--log-file", default=None)
-    parser.add_argument("--max-backups", type=int, default=10)
+    parser.add_argument("--max-backups", type=int, default=None)
+    parser.add_argument("--upload-dir", default=None)
+    parser.add_argument("--recent-uploads-dir", default=None)
+    parser.add_argument("--state-file", default=None)
     args = parser.parse_args()
 
-    main_dir = Path(args.main_dir).expanduser()
-    backup_dir = Path(args.backup_dir).expanduser() if args.backup_dir else main_dir / "Backup"
-    output_dir = Path(args.output_dir).expanduser() if args.output_dir else main_dir / "Files"
-    log_path = Path(args.log_file).expanduser() if args.log_file else main_dir / "sync.log"
+    config = load_config(Path(args.config)) if args.config else {}
+    remote_dir = str(args.remote_dir or config.get("remote_dir") or "/home/root/.local/share/remarkable/xochitl/")
+    remote_host = str(args.remote_host or config.get("remote_host") or "10.11.99.1")
+    remote_user = str(args.remote_user or config.get("remote_user") or "root")
+    ssh_port = int(args.ssh_port or config.get("ssh_port") or 22)
+
+    main_dir = resolve_path(args.main_dir or config.get("main_dir"), Path.home() / "Nextcloud" / "Documents" / "reMarkable")
+    backup_dir = resolve_path(args.backup_dir or config.get("backup_dir"), main_dir / "Backup")
+    output_dir = resolve_path(args.output_dir or config.get("output_dir"), main_dir / "Files")
+    upload_dir = resolve_path(args.upload_dir or config.get("upload_dir"), main_dir / "Upload")
+    recent_uploads_dir = resolve_path(args.recent_uploads_dir or config.get("recent_uploads_dir"), main_dir / "Recent Uploads")
+    log_path = resolve_path(args.log_file or config.get("log_file"), main_dir / "sync.log")
+    max_backups = int(args.max_backups or config.get("max_backups") or 10)
+    state_filename = str(args.state_file or config.get("state_file") or STATE_FILENAME)
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.touch(exist_ok=True)
@@ -292,15 +372,18 @@ def main() -> int:
         start = datetime.now()
         log_line(f"Start: {start.strftime('%Y-%m-%d %H:%M:%S')}", log_path)
         downloaded = sync_remarkable(
-            remote_dir=args.remote_dir,
-            remote_host=args.remote_host,
-            ssh_port=args.ssh_port,
-            remote_user=args.remote_user,
+            remote_dir=remote_dir,
+            remote_host=remote_host,
+            ssh_port=ssh_port,
+            remote_user=remote_user,
             main_dir=main_dir,
             backup_dir=backup_dir,
             output_dir=output_dir,
             log_path=log_path,
-            max_backups=args.max_backups,
+            upload_dir=upload_dir,
+            recent_uploads_dir=recent_uploads_dir,
+            max_backups=max_backups,
+            state_filename=state_filename,
         )
         end = datetime.now()
         duration = end - start

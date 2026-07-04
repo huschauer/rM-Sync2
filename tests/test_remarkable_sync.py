@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from remarkable_sync import build_output_plan, parse_metadata, prune_old_backups, prune_stale_files, should_download_document
+from remarkable_sync import build_output_plan, load_state, parse_metadata, prune_old_backups, prune_stale_files, remove_old_per_document_state_files, should_download_document
 
 
 class RemarkableSyncTests(unittest.TestCase):
@@ -63,11 +63,10 @@ class RemarkableSyncTests(unittest.TestCase):
             output_dir = Path(tmpdir)
             output_path = output_dir / "doc.pdf"
             output_path.write_bytes(b"content")
-            metadata_path = output_dir / "doc.sync.json"
-            metadata_path.write_text(json.dumps({"lastModified": "1700000000000"}), encoding="utf-8")
+            state = {"documents": {"doc-1": {"lastModified": "1700000000000"}}}
 
-            self.assertFalse(should_download_document(output_path, metadata_path, "1700000000000"))
-            self.assertTrue(should_download_document(output_path, metadata_path, "1800000000000"))
+            self.assertFalse(should_download_document(output_path, state, "doc-1", "1700000000000"))
+            self.assertTrue(should_download_document(output_path, state, "doc-1", "1800000000000"))
 
     def test_prune_stale_files_keeps_sync_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -88,6 +87,14 @@ class RemarkableSyncTests(unittest.TestCase):
 
             self.assertTrue((output_dir / "doc.sync.json").exists())
             self.assertFalse((output_dir / "stale.txt").exists())
+
+    def test_load_state_creates_default_documents(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            state = load_state(output_dir)
+
+            self.assertIsInstance(state, dict)
+            self.assertEqual(state["documents"], {})
 
 
 if __name__ == "__main__":
