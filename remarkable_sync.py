@@ -150,6 +150,7 @@ def build_output_plan(metadata_by_id: Dict[str, Dict[str, Any]], root: str) -> D
             "relative_path": relative_path,
             "display_name": item["visibleName"],
             "type": item["type"],
+            "lastModified": item["lastModified"],
         }
         output[item_id] = entry
         return entry
@@ -329,7 +330,8 @@ def sync_remarkable(remote_dir: str, remote_host: str, ssh_port: int, remote_use
     state = clean_state(state, plan)
     downloaded = download_documents(plan, output_dir, remote_host, log_path, state, state_filename=state_filename)
     uploaded = upload_files(upload_dir, recent_uploads_dir, remote_host, log_path)
-    log_line(f"Synchronisation abgeschlossen. Heruntergeladen: {downloaded}, Hochgeladen: {uploaded}", log_path)
+    log_line(f"Synchronisation abgeschlossen.", log_path)
+    log_line(f"Hochgeladen: {uploaded} Dateien.", log_path)
     return downloaded
 
 
@@ -387,8 +389,8 @@ def main() -> int:
         )
         end = datetime.now()
         duration = end - start
-        log_line(f"Erfolg. Heruntergeladen: {downloaded} Dateien. Dauer: {duration}", log_path)
-        print(f"Erfolg. Heruntergeladen: {downloaded} Dateien.")
+        log_line(f"Heruntergeladen: {downloaded} Dateien.", log_path)
+        log_line(f"Dauer: {duration}", log_path)
         return 0
     except Exception as exc:  # noqa: BLE001
         log_line(f"Fehler: {exc}", log_path)
